@@ -1,0 +1,6 @@
+# Ignore .terraform directories anywhere in the repository
+**/.terraform/
+**/.terraform/*
+.terraform**
+terraform.lock.hcl
+ 

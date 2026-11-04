@@ -1,0 +1,275 @@
+trigger:
+  branches:
+    include:
+      
+      - dev
+      - main
+      - staging
+  paths:
+    include:
+      - layers/**
+      - modules/**
+      - environments/**
+      - templates/**
+      - azure-pipelines.yml
+
+pool:
+  vmImage: 'ubuntu-24.04'
+
+variables:
+  - name: azureServiceConnectionName
+    value: 'azure'       # Update to your exact Service Connection name
+  - name: storageAccountResourceGroup
+    value: 'sa'
+  - name: storageAccountName
+    value: '123456909090'
+  - name: containerName
+    value: 'tfstate'
+  - name: terraformVersion
+    value: '1.9.8'
+
+stages:
+# ====================================================
+# Code Lint & Syntax Validation (Runs on all branches)
+# ====================================================
+- stage: Validate
+  displayName: 'Code Quality & Validation'
+  jobs:
+  - job: ValidateCode
+    displayName: 'Terraform Format & Validate'
+    steps:
+    - checkout: self
+
+    - bash: |
+        set -e
+        curl -fsSL "https://releases.hashicorp.com/terraform/$(terraformVersion)/terraform_$(terraformVersion)_linux_amd64.zip" -o terraform.zip
+        unzip -q terraform.zip
+        sudo mv terraform /usr/local/bin/
+      displayName: 'Install Terraform'
+
+    - bash: |
+        set -e
+        echo "##[section]Validating Terraform Formatting"
+        terraform fmt -check -recursive
+
+        echo "##[section]Validating Network Layer"
+        cd "$(System.DefaultWorkingDirectory)/layers/01-network"
+        terraform init -backend=false
+        terraform validate
+
+        echo "##[section]Validating AKS Layer"
+        cd "$(System.DefaultWorkingDirectory)/layers/02-aks"
+        terraform init -backend=false
+        terraform validate
+
+        echo "##[section]Validating KeyVault Layer"
+        cd "$(System.DefaultWorkingDirectory)/layers/03-vault"
+        terraform init -backend=false
+        terraform validate
+      displayName: 'Lint and Validate Layers'
+
+# ====================================================
+# Security Gate (Trivy IaC Misconfiguration)
+# ====================================================
+- stage: SecurityScan
+  displayName: 'IaC Security Scan'
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables['Build.Reason'], 'PullRequest'))
+  jobs:
+  - job: TrivyScan
+    displayName: 'Trivy IaC Scan'
+    steps:
+    - script: |
+        mkdir -p $(Build.ArtifactStagingDirectory)/trivy-reports
+        set +e
+        # /work is the input directory containing the Terraform code, 
+        # and /reports is the output directory for the SARIF report
+        docker run --rm \
+          -v $(Build.SourcesDirectory):/work \
+          -v $(Build.ArtifactStagingDirectory)/trivy-reports:/reports \
+          aquasec/trivy:latest config \
+          --severity HIGH,CRITICAL \
+          --format sarif \
+          --output /reports/trivy-terraform.sarif \
+          --exit-code 1 \
+          /work
+
+        SCAN_EXIT=$?
+        set -e
+
+        if [ $SCAN_EXIT -eq 1 ]; then
+          echo "##vso[task.logissue type=warning]Trivy detected HIGH or CRITICAL security misconfigurations in Terraform code."
+        elif [ $SCAN_EXIT -ne 0 ]; then
+          echo "##vso[task.logissue type=warning]Trivy scan exited with unexpected error code $SCAN_EXIT."
+        fi
+
+        exit 0
+      displayName: 'Run Trivy IaC Scan'
+
+    - publish: $(Build.ArtifactStagingDirectory)/trivy-reports
+      artifact: trivy-terraform-reports
+      displayName: 'Publish Security Scan Artifact'
+      condition: always()
+
+
+# ====================================================
+# DEVELOPMENT (dev / feature branches)
+# ====================================================
+- stage: DeployDev_Network
+  displayName: 'Deploy: Network (Dev)'
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/dev'))
+  jobs:
+  - template: templates/terraform-deploy.yaml
+    parameters:
+      layer: 'network'
+      environment: 'development'
+      envName: 'dev'
+      workingDir: '$(System.DefaultWorkingDirectory)/layers/01-network'
+      azureServiceConnection: '$(azureServiceConnectionName)'
+      storageAccountResourceGroup: '$(storageAccountResourceGroup)'
+      storageAccountName: '$(storageAccountName)'
+      containerName: '$(containerName)'
+      terraformVersion: '$(terraformVersion)'
+
+- stage: DeployDev_AKS
+  displayName: 'Deploy: AKS (Dev)'
+  dependsOn: DeployDev_Network
+  condition: succeeded()
+  jobs:
+  - template: templates/terraform-deploy.yaml
+    parameters:
+      layer: 'aks'
+      environment: 'development'
+      envName: 'dev'
+      workingDir: '$(System.DefaultWorkingDirectory)/layers/02-aks'
+      azureServiceConnection: '$(azureServiceConnectionName)'
+      storageAccountResourceGroup: '$(storageAccountResourceGroup)'
+      storageAccountName: '$(storageAccountName)'
+      containerName: '$(containerName)'
+      terraformVersion: '$(terraformVersion)'
+
+- stage: DeployDev_KeyVault
+  displayName: 'Deploy: KeyVault (Dev)'
+  dependsOn: DeployDev_AKS
+  condition: succeeded()
+  jobs:
+  - template: templates/terraform-deploy.yaml
+    parameters:
+      layer: 'vault'
+      environment: 'development'
+      envName: 'dev'
+      workingDir: '$(System.DefaultWorkingDirectory)/layers/03-vault'
+      azureServiceConnection: '$(azureServiceConnectionName)'
+      storageAccountResourceGroup: '$(storageAccountResourceGroup)'
+      storageAccountName: '$(storageAccountName)'
+      containerName: '$(containerName)'
+      terraformVersion: '$(terraformVersion)'
+
+# ====================================================
+# STAGING (staging branch)
+# ====================================================
+- stage: DeployStaging_Network
+  displayName: 'Deploy: Network (Staging)'
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/staging'))
+  jobs:
+  - template: templates/terraform-deploy.yaml
+    parameters:
+      layer: 'network'
+      environment: 'staging'
+      envName: 'staging'
+      workingDir: '$(System.DefaultWorkingDirectory)/layers/01-network'
+      azureServiceConnection: '$(azureServiceConnectionName)'
+      storageAccountResourceGroup: '$(storageAccountResourceGroup)'
+      storageAccountName: '$(storageAccountName)'
+      containerName: '$(containerName)'
+      terraformVersion: '$(terraformVersion)'
+
+- stage: DeployStaging_AKS
+  displayName: 'Deploy: AKS (Staging)'
+  dependsOn: DeployStaging_Network
+  condition: succeeded()
+  jobs:
+  - template: templates/terraform-deploy.yaml
+    parameters:
+      layer: 'aks'
+      environment: 'staging'
+      envName: 'staging'
+      workingDir: '$(System.DefaultWorkingDirectory)/layers/02-aks'
+      azureServiceConnection: '$(azureServiceConnectionName)'
+      storageAccountResourceGroup: '$(storageAccountResourceGroup)'
+      storageAccountName: '$(storageAccountName)'
+      containerName: '$(containerName)'
+      terraformVersion: '$(terraformVersion)'
+
+- stage: DeployStaging_KeyVault
+  displayName: 'Deploy: KeyVault (Staging)'
+  dependsOn: DeployStaging_Network
+  condition: succeeded()
+  jobs:
+  - template: templates/terraform-deploy.yaml
+    parameters:
+      layer: 'vault'
+      environment: 'staging'
+      envName: 'staging'
+      workingDir: '$(System.DefaultWorkingDirectory)/layers/03-vault'
+      azureServiceConnection: '$(azureServiceConnectionName)'
+      storageAccountResourceGroup: '$(storageAccountResourceGroup)'
+      storageAccountName: '$(storageAccountName)'
+      containerName: '$(containerName)'
+      terraformVersion: '$(terraformVersion)'
+
+# ====================================================
+# PRODUCTION (main branch)
+# ====================================================
+- stage: DeployProd_Network
+  displayName: 'Deploy: Network (Prod)'
+  dependsOn: Validate
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - template: templates/terraform-deploy.yaml
+    parameters:
+      layer: 'network'
+      environment: 'production'     # Set approval gate under Pipelines > Environments > production
+      envName: 'prod'
+      workingDir: '$(System.DefaultWorkingDirectory)/layers/01-network'
+      azureServiceConnection: '$(azureServiceConnectionName)' # In real prod, point to a dedicated prod service connection
+      storageAccountResourceGroup: '$(storageAccountResourceGroup)'
+      storageAccountName: '$(storageAccountName)'
+      containerName: '$(containerName)'
+      terraformVersion: '$(terraformVersion)'
+
+- stage: DeployProd_AKS
+  displayName: 'Deploy: AKS (Prod)'
+  dependsOn: DeployProd_Network
+  condition: succeeded()
+  jobs:
+  - template: templates/terraform-deploy.yaml
+    parameters:
+      layer: 'aks'
+      environment: 'production'
+      envName: 'prod'
+      workingDir: '$(System.DefaultWorkingDirectory)/layers/02-aks'
+      azureServiceConnection: '$(azureServiceConnectionName)'
+      storageAccountResourceGroup: '$(storageAccountResourceGroup)'
+      storageAccountName: '$(storageAccountName)'
+      containerName: '$(containerName)'
+      terraformVersion: '$(terraformVersion)'
+
+- stage: DeployProd_KeyVault
+  displayName: 'Deploy: KeyVault (Prod)'
+  dependsOn: DeployProd_AKS
+  condition: succeeded()
+  jobs:
+  - template: templates/terraform-deploy.yaml
+    parameters:
+      layer: 'vault'
+      environment: 'production'
+      envName: 'prod'
+      workingDir: '$(System.DefaultWorkingDirectory)/layers/03-vault'
+      azureServiceConnection: '$(azureServiceConnectionName)'
+      storageAccountResourceGroup: '$(storageAccountResourceGroup)'
+      storageAccountName: '$(storageAccountName)'
+      containerName: '$(containerName)'
+      terraformVersion: '$(terraformVersion)'

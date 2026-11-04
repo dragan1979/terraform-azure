@@ -1,0 +1,137 @@
+parameters:
+  - name: layer
+    type: string                       # e.g., 'network' or 'aks'
+  - name: environment
+    type: string                       # Azure DevOps Environment name (for approval gates), e.g., 'development'
+  - name: envName
+    type: string                       # Short slug matching your tfvars file, e.g., 'dev'
+  - name: workingDir
+    type: string                       # e.g., '$(System.DefaultWorkingDirectory)/layers/01-network'
+  - name: azureServiceConnection
+    type: string
+  - name: storageAccountResourceGroup
+    type: string
+  - name: storageAccountName
+    type: string
+  - name: containerName
+    type: string
+  - name: terraformVersion
+    type: string
+
+jobs:
+# ----------------------------------------------------
+# JOB 1: Plan & Speculative Execution
+# ----------------------------------------------------
+- job: Plan_${{ parameters.layer }}_${{ parameters.envName }}
+  displayName: 'Plan: ${{ parameters.layer }} (${{ parameters.envName }})'
+  steps:
+  - checkout: self
+
+  - bash: |
+      set -e
+      VERSION='${{ parameters.terraformVersion }}'
+      echo "Installing Terraform v${VERSION}..."
+      curl -fsSL "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip" -o terraform.zip
+      unzip -q terraform.zip
+      sudo mv terraform /usr/local/bin/
+      terraform -version
+    displayName: 'Install Terraform'
+
+  - task: AzureCLI@2
+    displayName: 'Terraform Init & Plan'
+    inputs:
+      azureSubscription: '${{ parameters.azureServiceConnection }}'
+      addSpnToEnvironment: true
+      scriptType: 'bash'
+      scriptLocation: 'inlineScript'
+      workingDirectory: '${{ parameters.workingDir }}'
+      inlineScript: |
+        set -e
+
+        # Map Azure DevOps Service Connection OIDC tokens to Terraform ARM variables
+        export ARM_CLIENT_ID=$servicePrincipalId
+        export ARM_OIDC_TOKEN=$idToken
+        export ARM_TENANT_ID=$tenantId
+        export ARM_USE_OIDC=true
+        export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+        # Initialize the isolated state file for this layer and environment
+        terraform init -input=false \
+          -backend-config="resource_group_name=${{ parameters.storageAccountResourceGroup }}" \
+          -backend-config="storage_account_name=${{ parameters.storageAccountName }}" \
+          -backend-config="container_name=${{ parameters.containerName }}" \
+          -backend-config="key=${{ parameters.envName }}-${{ parameters.layer }}.tfstate" \
+          -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID"
+
+        # Generate deterministic plan artifact using the root environments file
+        terraform plan \
+          -input=false \
+          -var-file="../../environments/${{ parameters.envName }}.tfvars" \
+          -out="${{ parameters.layer }}.tfplan"
+
+        # Render plain-text plan output in the pipeline logs for PR auditing
+        terraform show -no-color "${{ parameters.layer }}.tfplan"
+
+  - publish: ${{ parameters.workingDir }}/${{ parameters.layer }}.tfplan
+    artifact: tfplan-${{ parameters.layer }}-${{ parameters.envName }}
+    displayName: 'Publish Plan Artifact'
+
+
+# ----------------------------------------------------
+# JOB 2: Environment-Gated Apply
+# ----------------------------------------------------
+- deployment: Deploy_${{ parameters.layer }}_${{ parameters.envName }}
+  displayName: 'Apply: ${{ parameters.layer }} (${{ parameters.envName }})'
+  dependsOn: Plan_${{ parameters.layer }}_${{ parameters.envName }}
+  environment: ${{ parameters.environment }}
+  strategy:
+    runOnce:
+      deploy:
+        steps:
+        - checkout: self
+
+        - download: current
+          artifact: tfplan-${{ parameters.layer }}-${{ parameters.envName }}
+          displayName: 'Download Plan Artifact'
+
+        - bash: |
+            set -e
+            VERSION='${{ parameters.terraformVersion }}'
+            curl -fsSL "https://releases.hashicorp.com/terraform/${VERSION}/terraform_${VERSION}_linux_amd64.zip" -o terraform.zip
+            unzip -q terraform.zip
+            sudo mv terraform /usr/local/bin/
+          displayName: 'Install Terraform'
+
+        - task: AzureCLI@2
+          displayName: 'Terraform Init & Apply'
+          inputs:
+            azureSubscription: '${{ parameters.azureServiceConnection }}'
+            addSpnToEnvironment: true
+            scriptType: 'bash'
+            scriptLocation: 'inlineScript'
+            workingDirectory: '${{ parameters.workingDir }}'
+            inlineScript: |
+              set -e
+
+              export ARM_CLIENT_ID=$servicePrincipalId
+              export ARM_OIDC_TOKEN=$idToken
+              export ARM_TENANT_ID=$tenantId
+              export ARM_USE_OIDC=true
+              export ARM_SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+              # Reconnect to backend before applying
+              terraform init -input=false \
+                -backend-config="resource_group_name=${{ parameters.storageAccountResourceGroup }}" \
+                -backend-config="storage_account_name=${{ parameters.storageAccountName }}" \
+                -backend-config="container_name=${{ parameters.containerName }}" \
+                -backend-config="key=${{ parameters.envName }}-${{ parameters.layer }}.tfstate" \
+                -backend-config="subscription_id=$ARM_SUBSCRIPTION_ID"
+
+              # Copy the exact plan file into the layer working directory
+              cp "$(Pipeline.Workspace)/tfplan-${{ parameters.layer }}-${{ parameters.envName }}/${{ parameters.layer }}.tfplan" ./${{ parameters.layer }}.tfplan
+
+              # Execute the plan directly
+              terraform apply -input=false ${{ parameters.layer }}.tfplan
+
+              # Remove plan file from disk
+              rm -f ${{ parameters.layer }}.tfplan
